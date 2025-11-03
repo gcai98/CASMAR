@@ -16,8 +16,7 @@ We present **CASMAR (Cascaded Masked Autoregression)** — a two-stage, coarse-t
 
 - **Unreliable global context** at early steps in single-scale AR
 - **Fixed/random masking** that ignores per-image structural diversity
-- **Quadratic cost** and weak cross-window communication from global self-attention at large resolutions
-- **Train–inference mismatch** when conditioning refinement on ground truth
+- **Quadratic global self-attention ** at high resolutions
 
 #### 🧠 How CASMAR Works
 
