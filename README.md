@@ -2,7 +2,7 @@
 
 ![Qualitative Results](./demo/results.jpg)
 
-[**Cascaded Masked Autoregression for Image Generation: Unified Salience Scheduling and Proximal Self-Attention Synergy**]<be>
+**Cascaded Masked Autoregression for Image Generation: Unified Salience Scheduling and Proximal Self-Attention Synergy**<be>
 
 This is the official repository for the Paper "Cascaded Masked Autoregression for Image Generation: Unified Salience Scheduling and Proximal Self-Attention Synergy"
 
@@ -51,14 +51,6 @@ Clone the repo:
 ```
 git clone https://github.com/HiDream-ai/casmar.git
 cd casmar
-```
-
-Install dependencies:
-
-```
-conda env create -f environment.yaml
-
-conda activate casmar
 ```
 
 </details>
