@@ -31,7 +31,7 @@ We present **CASMAR (Cascaded Masked Autoregression)** — a two-stage, coarse-t
 - **Efficiency:** PSA cuts memory/compute at high resolution; ablations show **complementary gains** from the two-stage design, SAMS, and PSA.
 - **Scalable & controllable:** Works naturally with temperature, top-p, and CFG in an AR/MAR sampling loop.
 
-> TL;DR — **Coarse-to-fine masked autoregression + salience-aware masking + proximal attention** 
+
 
 
 ## 🔥 Updates
