@@ -15,8 +15,7 @@ import torch.nn as nn
 import numpy as np
 import math
 from typing import Tuple, Union
-from timm.models.vision_transformer import PatchEmbed, Mlp , Attention
-from einops import rearrange
+from timm.models.vision_transformer import PatchEmbed, Mlp
 import einops
 import torch.nn.functional as F
 
@@ -49,71 +48,114 @@ except ImportError:
 
 
 
-class ProximalAttention2D_PyTorch(nn.Module):
+
+
+class SALAAttention2D(nn.Module):
     """
-    Pure-PyTorch Proximal Attention 2D (channels-last).
+    Scaffold-Anchored Local Attention (SALA)
+
+    x: [B, N, C]      当前 Stage-2 高分辨率 token
+    z: [B, Nz, C]     Stage-1 scaffold condition tokens
+
+    输出:
+    out: [B, N, C]
+
+    结构:
+      1) local branch: 在 x 上做局部窗口注意力
+      2) anchor branch: x 查询压缩后的 scaffold anchors
+      3) gated fusion: out = o_loc + g * o_anc
     """
     def __init__(
         self,
-        embed_dim: int,
+        dim: int,
         num_heads: int = 8,
         kernel_size: int = 7,
         dilation: Union[int, Tuple[int, int]] = 1,
         qkv_bias: bool = True,
         proj_drop: float = 0.0,
+        anchor_pool_size: int = 2,
     ) -> None:
         super().__init__()
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
-        self.embed_dim = embed_dim
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+
+        self.dim = dim
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
+        self.kernel_size = int(kernel_size)
 
         if isinstance(dilation, int):
             self.dilation = (dilation, dilation)
         else:
             self.dilation = dilation
-        self.kernel_size = int(kernel_size)
-        assert self.kernel_size >= 1, "kernel_size must be >= 1"
-        # SAME padding (保持 H,W 不变)
+
         self.padding = (
             self.dilation[0] * (self.kernel_size - 1) // 2,
             self.dilation[1] * (self.kernel_size - 1) // 2,
         )
 
-        # QKV & Out 投影（逐 token，最后一维）
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.proj_drop = nn.Dropout(proj_drop)
+        self.anchor_pool_size = anchor_pool_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # -------- local branch --------
+        self.q_proj_loc = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k_proj_loc = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_proj_loc = nn.Linear(dim, dim, bias=qkv_bias)
+
+        # -------- anchor branch --------
+        self.q_proj_anc = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k_proj_anc = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_proj_anc = nn.Linear(dim, dim, bias=qkv_bias)
+
+        # -------- gate + output --------
+        self.gate_proj = nn.Linear(dim * 3, dim, bias=True)
+        self.out_proj = nn.Linear(dim, dim, bias=True)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.anchor_norm = nn.LayerNorm(dim)
+
+    def _pool_anchors(self, z: torch.Tensor) -> torch.Tensor:
         """
-        x: [B, H, W, C] (channels-last)
-        y: [B, H, W, C]
+        z: [B, Nz, C] -> anchors: [B, Na, C]
         """
-        assert x.dim() == 4 and x.shape[-1] == self.embed_dim, "Expect [B,H,W,C] with C=embed_dim"
-        B, H, W, C = x.shape
-        HW = H * W
+        B, N, C = z.shape
+        H = W = int(N ** 0.5)
+        assert H * W == N, f"SALA anchor tokens must form square grid, got N={N}"
+
+        z = z.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()  # [B,C,H,W]
+        z = F.avg_pool2d(
+            z,
+            kernel_size=self.anchor_pool_size,
+            stride=self.anchor_pool_size
+        )  # [B,C,Ha,Wa]
+        z = z.permute(0, 2, 3, 1).contiguous().view(B, -1, C)     # [B,Na,C]
+        z = self.anchor_norm(z)
+        return z
+
+    def _local_branch(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B,N,C]
+        out_loc: [B,N,C]
+        """
+        B, N, C = x.shape
+        H = W = int(N ** 0.5)
+        assert H * W == N, f"SALA local branch expects square token grid, got N={N}"
+
         k = self.kernel_size
         dil_h, dil_w = self.dilation
         pad_h, pad_w = self.padding
 
-        # Q, K, V projections
-        q = self.q_proj(x)  # [B,H,W,C]
-        k_ = self.k_proj(x)
-        v_ = self.v_proj(x)
+        x_2d = x.view(B, H, W, C).contiguous()
 
+        q = self.q_proj_loc(x_2d)
+        k_ = self.k_proj_loc(x_2d)
+        v_ = self.v_proj_loc(x_2d)
 
         q = q.view(B, H, W, self.num_heads, self.head_dim).permute(0, 3, 4, 1, 2)   # [B,h,d,H,W]
-        k_ = k_.view(B, H, W, self.num_heads, self.head_dim).permute(0, 3, 4, 1, 2) # [B,h,d,H,W]
-        v_ = v_.view(B, H, W, self.num_heads, self.head_dim).permute(0, 3, 4, 1, 2) # [B,h,d,H,W]
+        k_ = k_.view(B, H, W, self.num_heads, self.head_dim).permute(0, 3, 4, 1, 2)
+        v_ = v_.view(B, H, W, self.num_heads, self.head_dim).permute(0, 3, 4, 1, 2)
 
-        q_flat = q.reshape(B * self.num_heads, self.head_dim, H * W)     # [B*h, d, HW]
-        k_4d  = k_.reshape(B * self.num_heads, self.head_dim, H, W)      # [B*h, d, H, W]
-        v_4d  = v_.reshape(B * self.num_heads, self.head_dim, H, W)      # [B*h, d, H, W]
-
+        q_flat = q.reshape(B * self.num_heads, self.head_dim, H * W)   # [Bh,d,HW]
+        k_4d = k_.reshape(B * self.num_heads, self.head_dim, H, W)
+        v_4d = v_.reshape(B * self.num_heads, self.head_dim, H, W)
 
         k_unf = F.unfold(
             k_4d,
@@ -121,7 +163,8 @@ class ProximalAttention2D_PyTorch(nn.Module):
             dilation=(dil_h, dil_w),
             padding=(pad_h, pad_w),
             stride=1,
-        )
+        )  # [Bh, d*k*k, HW]
+
         v_unf = F.unfold(
             v_4d,
             kernel_size=(k, k),
@@ -131,53 +174,51 @@ class ProximalAttention2D_PyTorch(nn.Module):
         )
 
         K2 = k * k
-        k_unf = k_unf.view(B * self.num_heads, self.head_dim, K2, H * W)
+        k_unf = k_unf.view(B * self.num_heads, self.head_dim, K2, H * W)   # [Bh,d,K2,HW]
         v_unf = v_unf.view(B * self.num_heads, self.head_dim, K2, H * W)
 
-        attn_logits = (q_flat.unsqueeze(2) * k_unf).sum(dim=1) * self.scale
+        attn_logits = (q_flat.unsqueeze(2) * k_unf).sum(dim=1) * self.scale   # [Bh,K2,HW]
+        attn = F.softmax(attn_logits, dim=1)
 
-        attn = F.softmax(attn_logits, dim=1)  # [B*h, K*K, HW]
-
-        out_flat = (attn.unsqueeze(1) * v_unf).sum(dim=2)
-
+        out_flat = (attn.unsqueeze(1) * v_unf).sum(dim=2)   # [Bh,d,HW]
         out = out_flat.view(B, self.num_heads, self.head_dim, H, W)
+        out = out.permute(0, 3, 4, 1, 2).contiguous().view(B, N, C)
+        return out
 
-        out = out.permute(0, 3, 4, 1, 2).contiguous().view(B, H, W, C)
+    def _anchor_branch(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B,N,C]
+        z: [B,Nz,C]
+        out_anc: [B,N,C]
+        """
+        B, N, C = x.shape
+        anchors = self._pool_anchors(z)  # [B,Na,C]
+        Na = anchors.shape[1]
 
+        q = self.q_proj_anc(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)       # [B,h,N,d]
+        k = self.k_proj_anc(anchors).view(B, Na, self.num_heads, self.head_dim).transpose(1, 2) # [B,h,Na,d]
+        v = self.v_proj_anc(anchors).view(B, Na, self.num_heads, self.head_dim).transpose(1, 2) # [B,h,Na,d]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale   # [B,h,N,Na]
+        attn = attn.softmax(dim=-1)
+
+        out = attn @ v                                  # [B,h,N,d]
+        out = out.transpose(1, 2).contiguous().view(B, N, C)
+        return out
+
+    def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B,N,C]
+        z: [B,Nz,C]
+        """
+        o_loc = self._local_branch(x)       # [B,N,C]
+        o_anc = self._anchor_branch(x, z)   # [B,N,C]
+
+        g = torch.sigmoid(self.gate_proj(torch.cat([x, o_loc, o_anc], dim=-1)))  # [B,N,C]
+        out = o_loc + g * o_anc
         out = self.out_proj(out)
         out = self.proj_drop(out)
         return out
-
-class NAttention2DWrapper(nn.Module):
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 8,
-        kernel_size: int = 7,
-        dilation: Union[int, Tuple[int,int]] = 1,
-        qkv_bias: bool = True,
-        proj_drop: float = 0.0,
-    ) -> None:
-        super().__init__()
-        self.na = ProximalAttention2D_PyTorch(
-            embed_dim=dim,
-            num_heads=num_heads,
-            kernel_size=kernel_size,
-            dilation=dilation,
-            qkv_bias=qkv_bias,
-            proj_drop=proj_drop,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, N, C]  ->  [B, H, W, C] -> NA -> [B, N, C]
-        B, N, C = x.shape
-        H = W = int(N ** 0.5)
-        assert H * W == N, f"NATTEN expects square token grid. Got N={N}, not H*W."
-        x = x.view(B, H, W, C).contiguous()
-        x = self.na(x)
-        x = x.view(B, N, C).contiguous()
-        return x
 
 
 
@@ -189,48 +230,6 @@ def modulate2(x, shift, scale):
 def modulate3(x, scale):
     return x * (1 + scale)
 
-def attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, dropout_p: float):
-    if USE_FLASH_ATTN3:
-        hidden_states = flash_attn_func(query, key, value, causal=False, deterministic=False)[0]
-    else:
-        hidden_states = flash_attn_func(query, key, value, dropout_p=dropout_p, causal=False)
-    hidden_states = hidden_states.flatten(-2)
-    hidden_states = hidden_states.to(query.dtype)
-    return hidden_states
-
-class FAttention(nn.Module):
-    def __init__(
-            self,
-            dim: int,
-            num_heads: int = 8,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            attn_drop: float = 0.,
-            proj_drop: float = 0.,
-            norm_layer: nn.Module = nn.LayerNorm,
-    ) -> None:
-        super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.attn_drop = attn_drop
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x: torch.Tensor):
-        B, N, C = x.shape
-        qkv = self.qkv(x)
-        qkv = einops.rearrange(qkv, 'B L (K H D) -> K B L H D', K=3, H=self.num_heads)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # B L H D
-        x = attention(q, k, v, self.attn_drop)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
 
 
 class TimestepEmbedder(nn.Module):
@@ -308,47 +307,58 @@ class LabelEmbedder(nn.Module):
 class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
-    默认使用邻域注意力；可通过 use_natten=False 回退到全局注意力。
+    使用 SALA Attention 替代原来的 ProximalAttention / NAttention。
     """
     def __init__(
         self,
         hidden_size,
         num_heads,
         mlp_ratio=2.0,
-        use_natten: bool = True,
         na_kernel_size: int = 7,
-        na_dilation: Union[int, Tuple[int,int]] = 1,
+        na_dilation: Union[int, Tuple[int, int]] = 1,
+        anchor_pool_size: int = 2,
         qkv_bias: bool = True,
         **block_kwargs
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-
-        if use_natten:
-            self.attn = NAttention2DWrapper(
-                dim=hidden_size,
-                num_heads=num_heads,
-                kernel_size=na_kernel_size,
-                dilation=na_dilation,
-                qkv_bias=qkv_bias,
-                proj_drop=0.0,
-            )
-            
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        self.attn = SALAAttention2D(
+            dim=hidden_size,
+            num_heads=num_heads,
+            kernel_size=na_kernel_size,
+            dilation=na_dilation,
+            qkv_bias=qkv_bias,
+            proj_drop=0.0,
+            anchor_pool_size=anchor_pool_size,
+        )
+
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden_dim,
+            act_layer=approx_gelu,
+            drop=0
+        )
+
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
     def forward(self, x, c, z):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate_msa * self.attn(modulate2(self.norm1(x), shift_msa, scale_msa))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+            self.adaLN_modulation(c).chunk(6, dim=-1)
+
+        x_norm = modulate2(self.norm1(x), shift_msa, scale_msa)
+
+        attn_out = self.attn(x_norm, z)
+
+        x = x + gate_msa * attn_out
         x = x + gate_mlp * self.mlp(modulate2(self.norm2(x), shift_mlp, scale_mlp))
         return x
-
 
 class FinalLayer(nn.Module):
     """
@@ -387,9 +397,9 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=False,
-        use_natten: bool = True,
         na_kernel_size: int = 7,
         na_dilation: Union[int, Tuple[int,int]] = 1,
+        anchor_pool_size: int = 2,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -401,6 +411,7 @@ class DiT(nn.Module):
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
+        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         self.c_embedder = PatchEmbed(input_size, patch_size, c_channels, hidden_size, bias=True)
         num_patches = self.x_embedder.num_patches
         c_num_patches = self.c_embedder.num_patches
@@ -409,11 +420,12 @@ class DiT(nn.Module):
 
         self.blocks = nn.ModuleList([
             DiTBlock(
-                hidden_size, num_heads,
+                hidden_size,
+                num_heads,
                 mlp_ratio=mlp_ratio,
-                use_natten=use_natten,
                 na_kernel_size=na_kernel_size,
                 na_dilation=na_dilation,
+                anchor_pool_size=anchor_pool_size,
             ) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
@@ -430,6 +442,13 @@ class DiT(nn.Module):
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
+        c_pos_embed = get_2d_sincos_pos_embed(
+            self.c_pos_embed.shape[-1],
+            int(self.c_embedder.num_patches ** 0.5)
+        )
+        self.c_pos_embed.data.copy_(torch.from_numpy(c_pos_embed).float().unsqueeze(0))
+        
+
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
@@ -440,6 +459,10 @@ class DiT(nn.Module):
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+            if hasattr(block.attn, "gate_proj"):
+                nn.init.zeros_(block.attn.gate_proj.weight)
+                nn.init.constant_(block.attn.gate_proj.bias, -2.0)
 
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
@@ -467,7 +490,7 @@ class DiT(nn.Module):
             return outputs
         return ckpt_forward
 
-    def forward(self, x, t, y, z, mask=None,tokens=None):
+    def forward(self, x, t, y, z, mask=None, tokens=None, force_drop_ids=None):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -482,8 +505,13 @@ class DiT(nn.Module):
         if torch.any(torch.isnan(x)):
             print("nan")
         t = self.t_embedder(t)                   # (N, D)
-        z = self.c_embedder(z) #+ self.c_pos_embed # (N, T, D)
-        c = t.unsqueeze(1) + z #+ y.unsqueeze(1)
+        y = self.y_embedder(y, self.training, force_drop_ids=force_drop_ids) if y is not None else None
+        z = self.c_embedder(z) + self.c_pos_embed
+
+        if y is not None:
+            c = t.unsqueeze(1) + z + y.unsqueeze(1)
+        else:
+            c = t.unsqueeze(1) + z
         for block in self.blocks:
             x = block(x, c, z) 
         if torch.any(torch.isnan(x)):
@@ -494,19 +522,41 @@ class DiT(nn.Module):
             print("nan")
         return x
 
-    def forward_with_cfg(self, x, t, y, z, cfg_scale, mask=None,tokens=None):
+    def forward_with_cfg(self, x, t, y, z, cfg_scale, mask=None, tokens=None):
         """
-        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
+        Forward pass of DiT with classifier-free guidance.
+        First half: conditional
+        Second half: unconditional
         """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y, z,mask)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
+        half = len(x) // 2
+
+        half_x = x[:half]
+        half_t = t[:half]
+        half_z = z[:half]
+        half_y = y[:half] if y is not None else None
+
+        combined_x = torch.cat([half_x, half_x], dim=0)
+        combined_t = torch.cat([half_t, half_t], dim=0)
+        combined_z = torch.cat([half_z, half_z], dim=0)
+
+        if half_y is not None:
+            # 前一半 conditional，后一半 unconditional
+            force_drop_ids = torch.cat([
+                torch.zeros(half, device=half_y.device, dtype=torch.long),
+                torch.ones(half, device=half_y.device, dtype=torch.long)
+            ], dim=0)
+            combined_y = torch.cat([half_y, half_y], dim=0)
+        else:
+            force_drop_ids = None
+            combined_y = None
+
+        model_out = self.forward(
+            combined_x, combined_t, combined_y, combined_z,
+            mask=mask, tokens=tokens, force_drop_ids=force_drop_ids
+        )
+
         eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        cond_eps, uncond_eps = torch.split(eps, half, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)

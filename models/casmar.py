@@ -28,16 +28,22 @@ class MaskRatioGenerator:
 
 
 def mask_by_order(mask_len, order, bsz, seq_len):
-    masking = torch.zeros(bsz, seq_len).cuda()
-    masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()],
-                            src=torch.ones(bsz, seq_len).cuda()).bool()
+    device = order.device
+    masking = torch.zeros(bsz, seq_len, device=device)
+    masking = torch.scatter(
+        masking, dim=-1, index=order[:, :mask_len.long()],
+        src=torch.ones(bsz, seq_len, device=device)
+    ).bool()
     return masking
 
 
 def mask_by_order_step(mask_len, order, bsz, seq_len, cond_len):
-    masking = torch.zeros(bsz, seq_len).cuda()
-    masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()],
-                            src=torch.ones(bsz, seq_len).cuda()).bool()
+    device = order.device
+    masking = torch.zeros(bsz, seq_len, device=device)
+    masking = torch.scatter(
+        masking, dim=-1, index=order[:, :mask_len.long()],
+        src=torch.ones(bsz, seq_len, device=device)
+    ).bool()
     masking[:, cond_len:] = 1
     return masking
 
@@ -413,7 +419,7 @@ class casmar(nn.Module):
             np.random.shuffle(order1)
             order = np.array(order + order1)
             orders.append(order)
-        orders = torch.Tensor(np.array(orders)).cuda().long()
+        device = self.mask_token.device
         return orders
 
     def random_masking(self, x, orders):
@@ -609,7 +615,9 @@ class casmar(nn.Module):
         class_embedding = self.class_emb(labels)
 
         x = self.patchify(imgs)   # (B, L_big, token_dim)
-        cond = self.patchify(cond)  # (B, L_small, cond_dim)
+        if cond is None:
+            raise ValueError("cond must not be None for CASMAR two-stage training.")
+        cond = self.patchify(cond)
 
         gt_latents = x.clone().detach()
         cond_gt_latents = cond.clone().detach()
@@ -814,7 +822,9 @@ class casmar(nn.Module):
                 raise NotImplementedError
 
             if cfg != 1.0:
-                null_label = (self.num_classes) * torch.ones_like(labels, device=labels.device)
+                if labels is None:
+                    raise ValueError("labels must not be None when cfg != 1.0")
+                null_label = self.num_classes * torch.ones_like(labels, device=labels.device)
                 cfg_labels = torch.cat([labels, null_label], dim=0)
             else:
                 cfg_labels = labels
