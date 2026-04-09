@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import torch
+print('cuda可用嗎？',torch.cuda.is_available())
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
@@ -24,14 +25,19 @@ def get_args_parser():
     parser.add_argument('--batch_size', default=128, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * # gpus')
 
+    # VAE parameters
     parser.add_argument('--img_size', default=256, type=int,
                         help='images input size')
-    parser.add_argument('--vae_path', default="pretrained_models/vae/kl16.ckpt", type=str,
+    # parser.add_argument('--vae_path', default="pretrained_models/vae/kl16.ckpt", type=str,
+    parser.add_argument('--vae_path', default=r"C:\caogang\MAR\mar-main-DIT\mar-main\pretrained_models\vae\kl16.ckpt", type=str,
                         help='images input size')
     parser.add_argument('--vae_embed_dim', default=16, type=int,
                         help='vae output embedding dimension')
+    # Dataset parameters
     parser.add_argument('--noise', action='store_true')
-    parser.add_argument('--data_path', default='./data/imagenet', type=str,
+    # parser.add_argument('--data_path', default='./data/imagenet', type=str,
+    parser.add_argument('--data_path', default=r"C:\caogang\MAR\tiny-imagenet-200-1percent", type=str,
+    # parser.add_argument('--data_path', default=r"F:\Image_Translation\face_emotion_dataset\tiny-imagenet-200\tiny-imagenet-200", type=str,
                         help='dataset path')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -43,6 +49,7 @@ def get_args_parser():
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
 
+    # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
@@ -50,6 +57,7 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
 
+    # caching latents
     parser.add_argument('--cached_path', default='./cached_dir', help='path to cached latents')
     parser.add_argument('--small_scale', default=128, type=int)
     return parser
@@ -63,6 +71,7 @@ def main(args):
 
     device = torch.device(args.device)
 
+    # fix the seed for reproducibility
     seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -72,6 +81,7 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
+    # augmentation following DiT and ADM
     transform_train = transforms.Compose([
         transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.img_size)),
         # transforms.RandomHorizontalFlip(),
@@ -95,6 +105,7 @@ def main(args):
         drop_last=False,  # Don't drop in cache
     )
 
+    # define the vae
     vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
 
     # training

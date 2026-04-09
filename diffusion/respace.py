@@ -133,6 +133,7 @@ class _WrappedModel:
         if ts.dtype != th.long and ts.dtype != th.int64:
             ts = ts.to(dtype=th.long)
         # 避免设备不一致
-        map_tensor = self.timestep_map.to(device=ts.device)
+        # map_tensor = self.timestep_map.to(device=ts.device)
+        map_tensor = th.as_tensor(self.timestep_map, device=ts.device, dtype=th.long)
         new_ts = map_tensor[ts]
         return self.model(x, new_ts, **model_kwargs)
